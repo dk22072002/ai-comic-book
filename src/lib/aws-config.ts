@@ -16,8 +16,9 @@ export const bedrockClient = new BedrockRuntimeClient({
 
 // Model IDs
 export const MODEL_IDS = {
-  CLAUDE: 'anthropic.claude-3-sonnet-20240229-v1:0',
-  STABLE_DIFFUSION: 'stability.sd3-5-large-v1:0',
+  // Using Claude 3.5 Sonnet which supports the completion API format
+  CLAUDE: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
+  STABLE_DIFFUSION: 'stability.stable-image-ultra-v1:0',
 };
 
 // Export the InvokeModelCommand for use in API routes

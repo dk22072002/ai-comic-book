@@ -1,5 +1,6 @@
 import { bedrockClient, MODEL_IDS, InvokeModelCommand } from '@/lib/aws-config';
-import { BedrockResponse, StoryPrompt, CharacterDefinition } from '@/types';
+import { StoryPrompt, Character, StoryOutline } from '@/types';
+import { generateImage } from './image-generation';
 
 // Helper function to add delay
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -30,233 +31,492 @@ async function retryWithBackoff<T>(
 }
 
 function cleanClaudeJSON(jsonString: string): string {
-  // Remove any markdown code block delimiters
-  let cleanedString = jsonString.replace(/```(?:json|JOSN|js|javascript|typescript)?\n([\s\S]*?)\n```/g, '$1');
-  
-  // Find the first occurrence of '{' or '[' and the last occurrence of '}' or ']'
-  const startIndex = Math.min(
-    cleanedString.indexOf('{') !== -1 ? cleanedString.indexOf('{') : Infinity,
-    cleanedString.indexOf('[') !== -1 ? cleanedString.indexOf('[') : Infinity
-  );
-  const endIndex = Math.max(
-    cleanedString.lastIndexOf('}'),
-    cleanedString.lastIndexOf(']')
-  );
-
-  // If both are found, extract the substring that contains the JSON
-  if (startIndex !== Infinity && endIndex !== -1 && endIndex > startIndex) {
-    cleanedString = cleanedString.substring(startIndex, endIndex + 1);
-    // Remove any trailing content after the last bracket
-    const lastBracketIndex = Math.max(
-      cleanedString.lastIndexOf('}'),
-      cleanedString.lastIndexOf(']')
-    );
-    if (lastBracketIndex !== -1) {
-      cleanedString = cleanedString.substring(0, lastBracketIndex + 1);
-    }
-    return cleanedString.trim();
-  }
-
-  // If a valid JSON structure isn't found, return an empty array string
-  console.warn('cleanClaudeJSON: Could not find valid JSON delimiters. Returning empty array string.');
-  return '[]';
-}
-
-export async function extractCharacterDefinitions(userDescription: string): Promise<CharacterDefinition[] | null> {
-  const systemPrompt = `You are an expert in visual storytelling. Analyze the story description below and extract every major character or creature that plays a key visual role. For each, describe the physical appearance in *high visual detail*—including clothing, body type, face, expressions, color schemes, accessories, and anything important for visual consistency.\n\nYour output must be a valid JSON array of objects in this format:\n[\n  {\n    "name": "Character or creature name (e.g., King, Dragon, Princess)",\n    "appearance": "Highly detailed visual description, suitable for comic book illustration."\n  }\n]\n\nOnly include characters that are either mentioned or strongly implied in the prompt.\n\nStory Description:\n"${userDescription}"`;
-
-  console.log('Extracting character definitions with prompt:', userDescription);
-
-  const command = new InvokeModelCommand({
-    modelId: MODEL_IDS.CLAUDE,
-    body: JSON.stringify({
-      anthropic_version: "bedrock-2023-05-31",
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: systemPrompt
-            }
-          ]
-        }
-      ],
-      max_tokens: 2500,
-      temperature: 0.7,
-      top_p: 1,
-    }),
-  });
-
-  const response = await retryWithBackoff(() => bedrockClient.send(command));
-  const result = JSON.parse(new TextDecoder().decode(response.body));
-  
-  // Add a robust check for the expected content structure
-  if (!result || !result.content || !Array.isArray(result.content) || !result.content[0] || !result.content[0].text) {
-    console.error('Claude response did not contain expected content structure:', result);
-    return null; // Return null if the structure is unexpected
-  }
-
-  const characterJson = result.content[0].text; // Directly access as we've validated
-
-  console.log('Raw character definitions response:', characterJson);
-  let characterDefinitions: CharacterDefinition[] = [];
   try {
-    // Log the raw JSON before cleaning
-    console.log('Raw JSON before cleaning:', characterJson);
-    
-    const cleanedCharacterJson = cleanClaudeJSON(characterJson || '');
-    console.log('Cleaned JSON:', cleanedCharacterJson);
-    
-    // Additional cleaning: remove any content after the last valid closing bracket
-    const lastBracketIndex = cleanedCharacterJson.lastIndexOf(']');
-    const finalJson = lastBracketIndex !== -1 ? cleanedCharacterJson.substring(0, lastBracketIndex + 1) : cleanedCharacterJson;
-    console.log('Final JSON to parse:', finalJson);
-    
-    characterDefinitions = JSON.parse(finalJson) as CharacterDefinition[];
-    console.log('Successfully parsed character definitions:', characterDefinitions);
-  } catch (e) {
-    console.error('Failed to parse character definitions JSON:', e);
-    console.error('Problematic JSON string:', characterJson);
-    return null;
-  }
-
-  // Now, generate a reference image for each character
-  for (const char of characterDefinitions) {
+    // First, try to parse it directly
     try {
-      const portraitPrompt = `Highly detailed comic book style illustration, full-body portrait of ${char.appearance}, neutral pose, white background. Consistent character visuals.`;
-      const base64Image = await generateImage(portraitPrompt, []); // Use text-to-image to generate initial portrait
-      char.base64Image = base64Image;
-      console.log(`Generated reference image for ${char.name}`);
-    } catch (e) {
-      console.error(`Failed to generate reference image for ${char.name}:`, e);
-      // Optionally, you might want to return null here or continue without the image
+      return JSON.stringify(JSON.parse(jsonString));
+    } catch (parseError) {
+      console.log('Direct parsing failed, attempting to clean the JSON');
+    }
+    
+    // Remove any markdown code block markers
+    let cleaned = jsonString.replace(/```json\n?|\n?```/g, '');
+    
+    // Remove any comments
+    cleaned = cleaned.replace(/\/\/.*$/gm, '');
+    
+    // Remove any trailing commas in arrays and objects
+    cleaned = cleaned.replace(/,(\s*[}\]])/g, '$1');
+    
+    // Try to parse the cleaned string
+    try {
+      const parsed = JSON.parse(cleaned);
+      return JSON.stringify(parsed);
+    } catch (secondError) {
+      console.log('First cleaning attempt failed, trying alternative approach');
+      
+      // Try a different approach: parse the string as a raw string
+      try {
+        // Convert the string to a raw string by replacing all escaped characters
+        const rawString = cleaned
+          .replace(/\\n/g, '\n')  // Convert escaped newlines to actual newlines
+          .replace(/\\"/g, '"')   // Convert escaped quotes to actual quotes
+          .replace(/\\\\/g, '\\'); // Fix double escaped backslashes
+        
+        // Now try to parse it
+        const parsed = JSON.parse(rawString);
+        return JSON.stringify(parsed);
+      } catch (thirdError) {
+        // If all else fails, try one last approach
+        console.log('All cleaning attempts failed, trying final approach');
+        
+        // Try to parse it as a raw string with minimal cleaning
+        const finalAttempt = cleaned
+          .replace(/\\n/g, '\n')  // Convert escaped newlines to actual newlines
+          .replace(/\\"/g, '"')   // Convert escaped quotes to actual quotes
+          .replace(/\\\\/g, '\\') // Fix double escaped backslashes
+          .replace(/\n/g, '\\n')  // Convert newlines back to escaped newlines
+          .replace(/"/g, '\\"');  // Escape all quotes
+        
+        const parsed = JSON.parse(finalAttempt);
+        return JSON.stringify(parsed);
+      }
+    }
+  } catch (error) {
+    console.error('Error cleaning JSON:', error);
+    console.error('Original string:', jsonString);
+    throw error;
+  }
+}
+
+// Function to format character appearance into a string (robust for string or object)
+function formatCharacterAppearance(appearance: any): string {
+  if (typeof appearance === 'string') {
+    return appearance;
+  }
+  if (typeof appearance === 'object' && appearance !== null) {
+    if (typeof appearance.appearance === 'string') {
+      return appearance.appearance;
+    }
+    if (appearance.keyFeatures) {
+      return Object.values(appearance.keyFeatures).filter(Boolean).join(', ');
+    }
+    if (Array.isArray(appearance.visualAnchors)) {
+      return appearance.visualAnchors.join(', ');
+    }
+  }
+  return '';
+}
+
+// Function to escape regex special characters
+function escapeRegExp(string: string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& means the whole matched string
+}
+
+// Helper to normalize character name for placeholder
+function normalizeNameForPlaceholder(name: string) {
+  return name.replace(/^The\s+/i, '').trim().toUpperCase().replace(/\s+/g, '_');
+}
+
+// Helper to condense a character anchor to N features
+function condenseAnchor(description: string, maxFeatures = 5): string {
+  return description.split(',').slice(0, maxFeatures).join(',').trim();
+}
+
+// Helper to build character anchors/macros
+function getCharacterAnchors(characters: Character[]): Record<string, string> {
+  const anchors: Record<string, string> = {};
+  for (const c of characters) {
+    anchors[c.name] = formatCharacterAppearance(c.appearance).trim();
+  }
+  return anchors;
+}
+
+// Helper to add uniqueness phrasing to anchors
+function addUniquenessPhrasing(name: string, anchor: string, isFirstPanel: boolean = false): string {
+  // Use 'the only' for first panel, 'the same' for subsequent panels
+  if (isFirstPanel) {
+    return `the only ${name.toLowerCase()}, ${anchor}`;
+  } else {
+    return `the same ${name.toLowerCase()} from previous panel, ${anchor}`;
+  }
+}
+
+// Helper to combine character descriptions into a single, vivid sentence
+function combineCharacterDescriptions(characters: Character[]): string {
+  return characters
+    .map(c => {
+      const desc = condenseAnchor(formatCharacterAppearance(c.appearance).trim(), 5);
+      return `${c.name.toLowerCase()} (${desc})`;
+    })
+    .join(', ');
+}
+
+/**
+ * Build a concise prompt for a comic panel: style/action, background, and compact character descriptions.
+ * Targets ~400 characters for optimal image generation.
+ */
+export async function formatPanelWithCharacters(
+  panel: any,
+  characters: Character[]
+): Promise<string> {
+  // 1. Style + shot type
+  const style = 'Comic book style, dynamic poses, vibrant colors, sharp ink lines, dramatic lighting.';
+  const shotType = panel.visualComposition ? `${panel.visualComposition}.` : '';
+  const styleShot = `${style} ${shotType}`.trim();
+
+  // 2. Scene with pose and expressions
+  const scene = panel.scene || panel.description || '';
+  const poseDetails = panel.poseDetails ? `${panel.poseDetails}.` : '';
+  const expressions = panel.expressions ? `${panel.expressions}.` : '';
+  const sceneWithDetails = `${scene} ${poseDetails} ${expressions}`.trim();
+
+  // 3. Environment and lighting
+  const background = panel.background ? `${panel.background}.` : '';
+  const lighting = panel.lighting ? `${panel.lighting}.` : '';
+  const environment = `${background} ${lighting}`.trim();
+
+  // 4. Character descriptions with scale relationship
+  const absent = Array.isArray(panel.absentCharacters) ? panel.absentCharacters : [];
+  const presentCharacters = characters.filter(c => !absent.includes(c.name));
+  const characterSentence = presentCharacters.length > 0
+    ? combineCharacterDescriptions(presentCharacters) + '.'
+    : '';
+  const scaleRelationship = panel.scaleRelationship ? `${panel.scaleRelationship}.` : '';
+
+  // 5. Motion effects and damage
+  const motionEffects = panel.motionEffects ? `${panel.motionEffects}.` : '';
+  const damage = panel.damage ? `${panel.damage}.` : '';
+  const effects = `${motionEffects} ${damage}`.trim();
+
+  // 6. Final assembly with consistency marker
+  let prompt = [
+    styleShot,
+    sceneWithDetails,
+    environment,
+    characterSentence,
+    scaleRelationship,
+    effects,
+    'Only one of each character should appear.'
+  ].filter(Boolean).join(' ');
+
+  // 7. Trim if much longer than 420 chars (not a hard limit)
+  if (prompt.length > 420) {
+    console.warn('Prompt exceeds 420 characters:', prompt.length, prompt);
+    // Try to preserve the most important elements
+    const essentialParts = [
+      styleShot,
+      sceneWithDetails,
+      characterSentence,
+      'Only one of each character should appear.'
+    ].filter(Boolean).join(' ');
+    prompt = essentialParts;
+    if (prompt.length > 420) {
+      prompt = prompt.slice(0, 420);
+      if (!prompt.endsWith('.')) prompt += '.';
     }
   }
 
-  return characterDefinitions;
+  return prompt.trim();
 }
 
-export async function generateStoryOutline(prompt: { description: string }, characters: CharacterDefinition[], numPanels: number = 6): Promise<any | null> {
-  console.log('Generating story with prompt:', prompt);
-  console.log('Identified characters for storyline:', characters);
+export async function extractCharacterDefinitions(storyDescription: string): Promise<Character[]> {
+  const prompt = `You are a character designer for a comic book. Identify the main characters in the following story description. For each character, provide a single, vivid sentence describing their appearance.
 
-  const characterDescriptions = characters.map(c => `${c.name}: ${c.appearance}`).join('\n');
-  const systemPrompt = `You are a comic writer and visual scene planner for AI-generated comics.\n\nBreak the story described below into ${numPanels} **comic panels**. Each panel should advance the plot meaningfully with clear *actions*, *scene setting*, and *character interactions*. \n\nFor each panel:\n- Write a short but expressive **narrative description** (what happens)\n- Generate a **single-sentence image prompt** for AI image generation, packed with visual cues. This prompt must include:\n  - "Panel X of ${numPanels}." (Replace X with the panel number)\n  - The precise stylistic directives: "Highly detailed comic book style illustration, vibrant colors, dynamic poses, sharp outlines, dramatic lighting."
-  - **Full, consistent visual descriptions for ALL recurring characters/creatures from the 'Character Definitions' provided below.** Do NOT assume the model remembers character details from previous prompts or panels.\n  - **Visual anchor phrases for consistency**: "Same [Character Name] as previous panel," "Consistent [Character Name] design with [appearance/key features]" for each character/creature present."
-  - Precise character positioning, outfits, lighting, background, and expressions relevant to the panel.\n\nEach panel should logically follow from the previous one. Ensure that the last frame of one panel sets up the action or placement in the next panel. Characters should remain in-frame unless narratively removed, and their consistent presence and appearance are paramount.\n\nAvoid internal thoughts or abstract storytelling—focus only on things that can be drawn.\n\nCharacter Definitions:\n${characterDescriptions}\n\nStory Description:\n"${prompt.description}"\n\nReturn this structure:\n{\n  "panels": [\n    {\n      "description": "Panel story here...",\n      "imagePrompt": "Panel 1 of ${numPanels}. Highly detailed comic book style illustration, vibrant colors, dynamic poses, sharp outlines, dramatic lighting. Full character descriptions here. Visual anchor phrases here. Scene details and character interactions.",\n      "mainCharacterName": "King" // Example: The name of the most visually prominent character in this panel.\n    },\n    {\n      "description": "Panel story here...",\n      "imagePrompt": "Panel 2 of ${numPanels}. Highly detailed comic book style illustration, vibrant colors, dynamic poses, sharp outlines, dramatic lighting. Full character descriptions here. Visual anchor phrases here. Scene details and character interactions.",\n      "mainCharacterName": "King" // Example: The name of the most visually prominent character in this panel.\n    },\n    // ... up to ${numPanels} panels\n  ]\n}`;
+Story Description:
+${storyDescription}
 
-  console.log('Sending to Claude:', systemPrompt);
+CRITICAL FORMAT REQUIREMENTS - YOUR RESPONSE WILL BE REJECTED IF THESE ARE NOT FOLLOWED:
+1. EVERY character description MUST:
+   - Start with gender (e.g., "Male," "Female," "Non-binary")
+   - Include hair details (e.g., "long black hair," "short curly red hair," "bald")
+   - Then list 2-3 other visual traits
+2. NO EXCEPTIONS - even for non-human characters:
+   - For dragons/creatures: Start with "Creature" or "Beast" instead of gender
+   - For robots/constructs: Start with "Construct" or "Machine"
+   - For spirits/ghosts: Start with "Spirit" or "Ethereal"
+3. Each description MUST be under 100 characters
+4. Each description MUST be a single sentence
 
-  const command = new InvokeModelCommand({
-    modelId: MODEL_IDS.CLAUDE,
-    body: JSON.stringify({
-      anthropic_version: "bedrock-2023-05-31",
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: systemPrompt
-            }
-          ]
-        }
-      ],
-      max_tokens: 2500,
-      temperature: 0.7,
-      top_p: 1,
-    }),
-  });
+CORRECT EXAMPLES:
+[
+  {
+    "name": "King",
+    "appearance": "Male, long brown beard braided with gold, gold crown with rubies, polished steel armor, crimson cape"
+  },
+  {
+    "name": "Dragon",
+    "appearance": "Beast, emerald scales, curved ivory horns, tattered leather wings, orange flame-lit throat"
+  }
+]
 
-  const response = await retryWithBackoff(() => bedrockClient.send(command));
-  const rawResponseBody = new TextDecoder().decode(response.body); // Decode raw response body
-  console.log('Raw Bedrock Response Body (decoded): ', rawResponseBody); // Log it
-  const result = JSON.parse(rawResponseBody);
-  
-  // Safely access rawClaudeText, returning null if content is not as expected
-  const rawClaudeText = result.content?.[0]?.text;
+INCORRECT EXAMPLES (DO NOT USE):
+{
+  "name": "King",
+  "appearance": "Gold crown with rubies, polished steel armor, crimson cape, long brown beard braided with gold"
+}
+{
+  "name": "Dragon",
+  "appearance": "Emerald scales, curved ivory horns, tattered leather wings, orange flame-lit throat"
+}
 
-  console.log(`Claude raw result (full object): ${JSON.stringify(result, null, 2)}`);
-  console.log('Claude result.content:', result.content);
-  console.log('Claude result.content[0]:', result.content?.[0]);
-  console.log(`Claude response text (result.content[0].text): ${rawClaudeText}`);
-  
-  let parsedOutline: any = null; // Initialize to null
+Output Format:
+[
+  {
+    "name": "Character Name",
+    "appearance": "[Gender/Type], [hair/scales/features], [2-3 other visual traits] (≤100 characters)"
+  }
+]
+
+VALIDATION CHECK:
+Before returning your response, verify that:
+1. Every description starts with a gender/type identifier
+2. Every description includes hair/scales/features
+3. No description exceeds 120 characters
+4. All descriptions follow the exact format shown in the correct examples`;
 
   try {
-    if (rawClaudeText) {
-      const cleanedClaudeText = cleanClaudeJSON(rawClaudeText); // Declare locally
-      console.log('Cleaned Claude Text (before final parse):', cleanedClaudeText); // Log cleaned text
-      parsedOutline = JSON.parse(cleanedClaudeText);
-      console.log('Parsed Story Outline:', parsedOutline);
-    } else {
-      // If rawClaudeText is null or undefined, consider it a parsing failure
-      console.warn('Claude returned no text content.');
-      parsedOutline = null;
-    }
-  } catch (e) {
-    console.error('Failed to parse or clean story outline JSON:', e);
-    console.error('Raw Claude text that failed to parse:', rawClaudeText); // Log problematic raw text
-    parsedOutline = null; // Set to null on any parsing/cleaning error
+    const response = await invokeClaude(prompt);
+    console.log('Raw character definitions response:', response);
+    
+    const cleanedResponse = cleanClaudeJSON(response);
+    const parsedCharacters = JSON.parse(cleanedResponse) as { name: string; appearance: string }[];
+    console.log('Successfully parsed character definitions:', parsedCharacters);
+    
+    // Convert to Character objects with string appearance
+    const characters = parsedCharacters.map(char => ({
+      name: char.name,
+      // Store the string description directly in the appearance field
+      // This is safe because the formatter function will handle both string and object types
+      appearance: char.appearance as any
+    }));
+    
+    return characters;
+  } catch (error) {
+    console.error('Error extracting character definitions:', error);
+    return [];
   }
-
-  return parsedOutline; // Return the parsed object or null
 }
 
-export async function generateImage(prompt: string, additionalNegativePrompts: string[] = [], initImage?: string, strength: number = 0.7): Promise<string | null> {
-  console.log('Generating image with prompt:', prompt);
-  console.log('Using initImage:', !!initImage);
-  console.log('Image strength:', strength);
+// Helper to extract key features from a character's appearance string
+function extractKeyFeatures(appearance: string): string[] {
+  // Skip the first segment (gender/type), then trim and filter
+  return appearance
+    .split(',')
+    .slice(1) // skip the first segment (gender/type)
+    .map(f => f.trim())
+    .filter(f => f.length > 0);
+}
 
-  const baseNegativePrompts = [
-    "photorealistic, blurry, low quality, distorted, deformed, inconsistent characters, inconsistent settings, text, watermark, bad anatomy, ugly, tiling, poorly drawn, out of frame, disfigured, deformed, body out of frame, bad anatomy, watermark, signature, cut off, low contrast, underexposed, overexposed, grayscale, black and white, blurry, cloned face, duplicate, extra limbs, mutated, gross, disgusting"
+// Helper function to build optimized negative prompts
+function buildNegativePrompt(charactersInPanel: { name: string, appearance: string }[]): string {
+  const baseNegatives = [
+    "photorealistic",
+    "blurry",
+    "out of frame",
+    "inconsistent character design",
+    "mutated limbs",
+    "wrong costume",
+    "floating objects",
+    "character facing away from action",
+    "overly dark panels",
+    "portrait framing",
+    "duplicate characters",
+    "generic fantasy creatures",
+    "generic armor",
+    "overgrown dragon heads",
+    "alien features",
+    "multiple versions of character",
+    "inconsistent hairstyle"
   ];
 
-  const combinedNegativePrompts = [...baseNegativePrompts, ...additionalNegativePrompts].join(', ');
-
-  const requestBody: any = {
-    prompt: prompt,
-    negative_prompt: combinedNegativePrompts,
-    seed: Math.floor(Math.random() * 1000000),
-    output_format: "png",
-  };
-
-  if (initImage) {
-    requestBody.mode = "image-to-image";
-    requestBody.image = initImage;
-    requestBody.strength = strength;
-  } else {
-    requestBody.mode = "text-to-image";
-    requestBody.aspect_ratio = "1:1";
-  }
-
-  const command = new InvokeModelCommand({
-    modelId: MODEL_IDS.STABLE_DIFFUSION,
-    body: JSON.stringify(requestBody),
+  const characterNegatives = charactersInPanel.flatMap(char => {
+    const name = char.name.toLowerCase();
+    const features = extractKeyFeatures(char.appearance || '');
+    // Debug logging
+    console.log(`Appearance for ${char.name}:`, char.appearance);
+    console.log(`Features for ${char.name}:`, features);
+    const negatives = [
+      `inconsistent ${name}`,
+      `changing ${name}'s appearance`,
+      `changing ${name}'s clothes`,
+      `duplicate ${name}`
+    ];
+    // Add feature-specific negatives
+    features.forEach(feature => {
+      const mainWord = feature.split(' ').pop();
+      if (mainWord && mainWord.length > 2) {
+        negatives.push(`changing ${name}'s ${mainWord}`);
+        negatives.push(`removing ${name}'s ${mainWord}`);
+      }
+    });
+    return negatives;
   });
 
-  // Add delay between image generation requests
-  await delay(2000); // 2 second delay
-
-  const response = await retryWithBackoff(() => bedrockClient.send(command));
-  const result = JSON.parse(new TextDecoder().decode(response.body));
-
-  console.log('Stable Diffusion raw result (full object):', JSON.stringify(result, null, 2));
-
-  // Check if images array exists and has at least one image
-  if (!result || !result.images || !Array.isArray(result.images) || result.images.length === 0) {
-    console.error('Stable Diffusion response did not contain expected images array:', result);
-    return null;
-  }
-
-  console.log('Stable Diffusion response received');
-  return result.images[0];
+  const fullPrompt = [...baseNegatives, ...characterNegatives].join(', ');
+  return fullPrompt.length > 500 ? fullPrompt.slice(0, 497) + '...' : fullPrompt;
 }
 
-export function formatImagePrompt(prompt: string): string {
-  // Claude is now responsible for generating the full, detailed prompt with style and character info.
-  // This function simply returns the prompt as is.
-  console.log('Formatted image prompt (final):', prompt);
-  return prompt;
-} 
+// Update the generateStoryOutline function to pass full character objects for negatives
+export async function generateStoryOutline(
+  storyDescription: string,
+  characters: Character[],
+  numPanels: number = 6
+): Promise<StoryOutline | null> {
+  const characterDescriptions = characters.map(char => 
+    `${char.name}: ${char.appearance}`
+  ).join('\n\n');
+
+  const prompt = `You are a comic book storyboard artist. Create a story outline for a comic with ${numPanels} panels based on the story description and character definitions. Each panel should be a complete scene that advances the story while maintaining visual consistency.
+
+Story Description:
+${storyDescription}
+
+Character Definitions:
+${characterDescriptions}
+
+For each panel, provide the following fields:
+- scene: A concise summary of the main action and what is happening (1-2 sentences)
+- visualComposition: Camera angle, shot type, and spatial layout (e.g., "side view, low angle, dragon in foreground, king in background")
+- lighting: Lighting and atmosphere (e.g., "dramatic sunset, orange glow, deep shadows")
+- background: Important environment or setting details (e.g., "rocky cliff, stormy sky, castle ruins")
+- characters: An array of character names (e.g., ["The King", "The Dragon"]) who are present in this panel
+- continuityNotes: Brief notes about visual consistency with previous panels
+- poseDetails: Specific pose or action details (e.g., "cape trailing as he dives", "wings spread wide")
+- expressions: Character facial expressions and emotions (e.g., "eyes focused, jaw clenched", "snarling, mouth open")
+- motionEffects: Visual effects showing movement (e.g., "motion lines show speed", "smoke swirls behind")
+- scaleRelationship: Relative size and positioning (e.g., "dragon towering over king", "king small beside massive dragon")
+- damage: Any damage or changes to characters (e.g., "dragon's wing torn", "king's armor scorched")
+- imagePrompt: A single paragraph prompt for image generation, no more than 420 characters. The prompt must follow this structure:
+  1. Style and shot type (e.g., "Comic book style, dynamic aerial composition")
+  2. Scene description with pose details and expressions
+  3. Environmental details and lighting
+  4. Character descriptions - CRITICAL: Use the EXACT character definitions provided above, including gender and hair details
+  5. Motion effects and scale relationships
+  6. Damage or continuity markers
+  7. End with "Only one of each character should appear"
+
+IMPORTANT RULES FOR IMAGE PROMPTS:
+- ALWAYS use the complete character descriptions from the Character Definitions section
+- NEVER summarize or shorten character descriptions
+- Include ALL visual traits (gender, hair, clothing, etc.) for each character
+- Keep the total prompt under 420 characters while maintaining all character details
+
+Example of correct character description in image prompt:
+"Detective Morgan (Male, salt-pepper hair cropped short, weathered face with stubble, worn brown trenchcoat) examining evidence"
+
+Example of incorrect character description in image prompt:
+"Detective Morgan in trenchcoat examining evidence"
+
+Output format (valid JSON):
+{
+  "panels": [
+    {
+      "scene": "...",
+      "visualComposition": "...",
+      "lighting": "...",
+      "background": "...",
+      "characters": ["Character Name"],
+      "continuityNotes": "...",
+      "poseDetails": "...",
+      "expressions": "...",
+      "motionEffects": "...",
+      "scaleRelationship": "...",
+      "damage": "...",
+      "imagePrompt": "..."
+    }
+  ]
+}
+
+CRITICAL RULES:
+- Generate EXACTLY ${numPanels} panels - no more, no less
+- Output ONLY valid JSON - no comments, questions, or additional text
+- Always use the exact same visual description for each character in every panel
+- Do NOT paraphrase or shorten character descriptions except as required to fit the 420 character image prompt limit
+- Each panel must clearly describe the action, composition, and environment
+- Keep character descriptions to 4 strong visual elements maximum
+- Use foreground, midground, and background tags to help separate action layers
+- The total length of all panel fields must stay under 9000 characters
+- Image prompts should be between 380-415 characters for optimal detail vs. model attention`;
+
+  try {
+    const response = await invokeClaude(prompt);
+    console.log('Raw story outline response:', response);
+    
+    const cleanedResponse = cleanClaudeJSON(response);
+    const storyOutline = JSON.parse(cleanedResponse) as StoryOutline;
+    
+    // Validate that we have the correct number of panels
+    if (!storyOutline.panels || storyOutline.panels.length < numPanels) {
+      throw new Error(`Expected ${numPanels} panels but got ${storyOutline.panels?.length || 0}`);
+    }
+    if (storyOutline.panels.length > numPanels) {
+      storyOutline.panels = storyOutline.panels.slice(0, numPanels);
+    }
+
+    // Generate optimized negative prompts for each panel using full character objects
+    storyOutline.panels = storyOutline.panels.map(panel => {
+      const charsInPanel = (panel.characters || []).map(name => {
+        const char = characters.find(c => c.name === name) || { name, appearance: '' };
+        // Ensure appearance is a string
+        let appearanceStr: string;
+        if (typeof char.appearance === 'string') {
+          appearanceStr = char.appearance;
+        } else if (char.appearance && typeof char.appearance === 'object') {
+          appearanceStr = JSON.stringify(char.appearance);
+        } else {
+          appearanceStr = '';
+        }
+        return { name: char.name, appearance: appearanceStr };
+      });
+      return {
+        ...panel,
+        negativePrompt: buildNegativePrompt(charsInPanel)
+      };
+    }) as StoryOutline['panels'];
+    
+    console.log('Successfully parsed story outline:', storyOutline);
+    return storyOutline;
+  } catch (error) {
+    console.error('Error generating story outline:', error);
+    return null;
+  }
+}
+
+async function invokeClaude(prompt: string): Promise<string> {
+  try {
+  const command = new InvokeModelCommand({
+    modelId: MODEL_IDS.CLAUDE,
+      contentType: 'application/json',
+      accept: 'application/json',
+    body: JSON.stringify({
+      anthropic_version: "bedrock-2023-05-31",
+        max_tokens: 4096,
+        temperature: 0.7,
+        top_p: 0.9,
+      messages: [
+        {
+          role: "user",
+            content: prompt
+            }
+          ]
+    }),
+  });
+
+  const response = await retryWithBackoff(() => bedrockClient.send(command));
+    const responseBody = new TextDecoder().decode(response.body);
+    const result = JSON.parse(responseBody);
+    
+    // For Claude 3.5 Sonnet, the response is in the content field of the first message
+    if (!result || !result.content || !result.content[0] || !result.content[0].text) {
+      throw new Error('Claude response did not contain expected content field');
+    }
+
+    return result.content[0].text;
+  } catch (error) {
+    console.error('Error invoking Claude:', error);
+    throw error;
+  }
+}
+
+  

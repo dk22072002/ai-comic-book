@@ -37,8 +37,107 @@ export interface BedrockResponse {
   model: string;
 }
 
-export interface CharacterDefinition {
+export interface Character {
   name: string;
-  appearance: string; // Detailed visual description
-  base64Image?: string | null; // Optional: Stores the base64 encoded reference image
+  appearance: {
+    face?: {
+      hair?: {
+        color?: string;
+        length?: string;
+        style?: string;
+        texture?: string;
+        uniqueFeatures?: string;
+      };
+      eyes?: {
+        color?: string;
+        shape?: string;
+        size?: string;
+        distinctiveFeatures?: string;
+      };
+      nose?: {
+        shape?: string;
+        size?: string;
+        uniqueCharacteristics?: string;
+      };
+      faceShape?: {
+        jawline?: string;
+        cheekbones?: string;
+        forehead?: string;
+      };
+      facialFeatures?: {
+        scars?: string;
+        typicalExpression?: string;
+        wrinkles?: string;
+      };
+    };
+    body?: {
+      height?: string;
+      weight?: string;
+      build?: string;
+      posture?: {
+        howTheyStand?: string;
+        characteristicPoses?: string;
+        physicalLimitations?: string;
+      };
+      age?: string;
+      physicalDistinguishingFeatures?: string;
+    };
+    clothing?: {
+      robe?: {
+        color?: string;
+        material?: string;
+        length?: string;
+        details?: string;
+      };
+      armor?: {
+        material?: string;
+        color?: string;
+        details?: string;
+        thickness?: string;
+      };
+      // Add other clothing items as needed
+    };
+    accessories?: {
+      staff?: {
+        height?: string;
+        material?: string;
+        crystal?: string;
+      };
+      sword?: {
+        length?: string;
+        blade?: string;
+        hilt?: string;
+      };
+      shield?: {
+        shape?: string;
+        size?: string;
+        colors?: string;
+      };
+      // Add other accessories as needed
+    };
+  };
+  visualAnchors?: string[];
+  keyFeatures?: {
+    face: string;
+    body: string;
+    clothing: string;
+    accessories: string;
+  };
+}
+
+export interface StoryOutline {
+  panels: {
+    description: string;
+    imagePrompt: string;
+    continuityNotes: string;
+    visualComposition: string;
+    lighting: string;
+    background: string;
+    characters: string[];
+    poseDetails: string;
+    expressions: string;
+    motionEffects: string;
+    scaleRelationship: string;
+    damage: string;
+  }[];
 } 

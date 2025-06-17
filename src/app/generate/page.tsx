@@ -1,8 +1,58 @@
 'use client';
 
 import { useState } from 'react';
-import { generateStoryOutline, generateImage, formatImagePrompt, extractCharacterDefinitions } from '@/utils/bedrock';
+import { Character, StoryOutline } from '@/types';
+import { generateStoryOutline, extractCharacterDefinitions, formatPanelWithCharacters } from '@/utils/bedrock';
+import { generateImage, formatImagePrompt } from '@/utils/image-generation';
 import { ComicPanel, GenerationProgress } from '@/types';
+import Image from 'next/image';
+
+interface ProgressData {
+  status: string;
+  currentPanel: number;
+  totalPanels: number;
+  progress: number;
+}
+
+// Helper function to escape special characters for RegExp
+const escapeRegExp = (text: string): string => {
+  return text.replace(/[.*+?^${}()|[\\]]/g, '\\$&'); // $& means the whole matched string
+};
+
+// Helper to ensure all present character descriptions are in the prompt
+function ensureCharacterDescriptionsInPrompt(imagePrompt: string, presentCharacters: { name: string; appearance: any }[]): string {
+  let result = imagePrompt;
+  presentCharacters.forEach(char => {
+    const desc = typeof char.appearance === 'string' ? char.appearance : '';
+    if (desc && !result.includes(desc)) {
+      result += ` ${char.name}: ${desc}.`;
+    }
+  });
+  return result.trim();
+}
+
+// Helper to generate a deterministic seed from a string (e.g., character name)
+function hashStringToSeed(str: string): number {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash) + str.charCodeAt(i);
+  }
+  return Math.abs(hash) % 1000000; // 6 digits
+}
+
+// Helper to get a panel seed based on its characters (normalized and sorted)
+function getPanelSeed(charNames: string[]): number {
+  // Normalize: lowercase, trim, sort
+  const normalized = charNames.map(n => n.trim().toLowerCase()).sort();
+  if (normalized.length === 0) {
+    return Math.floor(Math.random() * 1000000);
+  }
+  if (normalized.length === 1) {
+    return hashStringToSeed(normalized[0]);
+  }
+  // Combine seeds for multiple characters (sum, then mod)
+  return normalized.reduce((acc, name) => acc + hashStringToSeed(name), 0) % 1000000;
+}
 
 export default function GeneratePage() {
   const [progress, setProgress] = useState<GenerationProgress>({
@@ -14,7 +64,7 @@ export default function GeneratePage() {
   const [panels, setPanels] = useState<ComicPanel[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [description, setDescription] = useState('');
-  const [storyOutline, setStoryOutline] = useState<any>(null);
+  const [storyOutline, setStoryOutline] = useState<StoryOutline | null>(null);
   const [numPanels, setNumPanels] = useState(6);
 
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -22,11 +72,19 @@ export default function GeneratePage() {
   };
 
   const handleNumPanelsChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setNumPanels(Number(e.target.value));
+    const value = Number(e.target.value);
+    // Ensure the value is between 1 and 12
+    const validValue = Math.min(Math.max(value, 1), 12);
+    setNumPanels(validValue);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    // Validate number of panels
+    if (numPanels < 1 || numPanels > 12) {
+      alert('Please select between 1 and 12 panels');
+      return;
+    }
     setIsGenerating(true);
     setPanels([]);
     setStoryOutline(null);
@@ -34,78 +92,95 @@ export default function GeneratePage() {
     await generateStory();
   };
 
+  const formatCharacterAppearance = (appearance: any): string => {
+    if (typeof appearance === 'string') {
+      return appearance;
+    }
+    // fallback for legacy object structure (shouldn't be needed now)
+    return '';
+  };
+
   const generateStory = async () => {
     try {
       setProgress(prev => ({ ...prev, status: 'Extracting characters...' }));
       const characters = await extractCharacterDefinitions(description);
       
-      if (characters === null) {
+      if (!characters || characters.length === 0) {
         setProgress(prev => ({ ...prev, status: 'Error: Failed to extract characters.' }));
         setIsGenerating(false);
-        return; // Stop the generation process
+        return;
       }
-
-      // Generate character-specific negative prompts dynamically
-      const characterNegativePrompts = characters.flatMap(char => [
-        `inconsistent ${char.name.toLowerCase()}`,
-        `changing ${char.name.toLowerCase()}'s appearance`,
-        `changing ${char.name.toLowerCase()}'s clothes`,
-        `changing ${char.name.toLowerCase()}'s crown` // This can be generalized further if needed
-      ]);
 
       console.log('Extracted characters:', characters);
-      console.log('Character-specific negative prompts:', characterNegativePrompts);
 
       setProgress(prev => ({ ...prev, status: 'Generating story outline...' }));
-      const storyPrompt = {
-        description,
-      };
-      const outline = await generateStoryOutline(storyPrompt, characters!, numPanels);
+      const outline = await generateStoryOutline(description, characters, numPanels);
       
-      if (outline === null) {
+      if (!outline) {
         setProgress(prev => ({ ...prev, status: 'Error: Story outline generation failed.' }));
         setIsGenerating(false);
-        return; // Stop the generation process
+        return;
       }
 
-      const parsedOutline = outline; // Directly assign the object
-      setStoryOutline(parsedOutline);
-
-      console.log('parsedOutline before panel access:', parsedOutline); // Added for debugging
-
-      // Validate the structure of the parsed outline
-      if (!parsedOutline || !Array.isArray(parsedOutline.panels)) {
-        setProgress(prev => ({ ...prev, status: 'Error: Invalid story outline structure.' }));
-        setIsGenerating(false);
-        return; // Stop the generation process
-      }
+      setStoryOutline(outline);
+      console.log('Story outline:', outline);
 
       setProgress(prev => ({ ...prev, status: 'Generating images...' }));
-      const panelsToGenerate = parsedOutline.panels || [];
+      const panelsToGenerate = outline.panels;
       setProgress(prev => ({ ...prev, totalPanels: panelsToGenerate.length }));
 
       for (let i = 0; i < panelsToGenerate.length; i++) {
-        const panel = panelsToGenerate[i];
-        const imagePrompt = formatImagePrompt(panel.imagePrompt);
+        const panel = panelsToGenerate[i] as unknown as {
+          scene: string;
+          visualComposition: string;
+          lighting: string;
+          background: string;
+          characters: string[];
+          continuityNotes: string;
+          poseDetails: string;
+          expressions: string;
+          motionEffects: string;
+          scaleRelationship: string;
+          damage: string;
+          imagePrompt: string;
+          negativePrompt: string;
+        };
+        console.log(`Panel ${i + 1} - panel.imagePrompt:`, panel.imagePrompt);
         
-        // Find the main character's reference image
-        const mainCharacter = characters.find(char => char.name === panel.mainCharacterName);
-        const initImage = mainCharacter?.base64Image || undefined;
-
         setProgress(prev => ({
           ...prev,
           currentPanel: i + 1,
           progress: ((i + 1) / panelsToGenerate.length) * 100,
         }));
-        const imageBase64 = await generateImage(imagePrompt, characterNegativePrompts, initImage, 0.7);
+
+        // Use deterministic seed for character consistency
+        const seed = getPanelSeed(panel.characters);
+        // Log the characters and seed for this panel
+        console.log(`Panel ${i + 1} - Characters:`, panel.characters, 'Seed:', seed);
+
+        const imageBase64 = await generateImage(
+          panel.imagePrompt,
+          panel.negativePrompt,
+          seed
+        );
+
         setPanels(prev => [...prev, {
           id: `panel-${Date.now()}-${i}`,
           imageUrl: imageBase64 ? `data:image/png;base64,${imageBase64}` : null,
-          description: panel.description,
-          prompt: imagePrompt,
+          description: panel.scene,
+          prompt: panel.imagePrompt,
           status: 'completed',
         }]);
       }
+
+      // After all panels are generated, log a summary mapping
+      console.log('Panel-to-seed mapping:', panelsToGenerate.map((p, i) => ({
+        panel: i + 1,
+        characters: p.characters,
+        normalizedCharacters: p.characters.map(n => n.trim().toLowerCase()).sort(),
+        seed: getPanelSeed(p.characters)
+      })));
+
       setProgress(prev => ({ ...prev, status: 'Complete!' }));
       setIsGenerating(false);
     } catch (error) {
@@ -149,7 +224,7 @@ export default function GeneratePage() {
                   value={numPanels}
                   onChange={handleNumPanelsChange}
                   min="1"
-                  max="10"
+                  max="12"
                   className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
                   required
                 />
@@ -209,12 +284,20 @@ export default function GeneratePage() {
             <div className="grid grid-cols-2 gap-4">
               {panels.map((panel) => (
                 <div key={panel.id} className="bg-white rounded-xl shadow-lg overflow-hidden">
-                  <div className="aspect-w-16 aspect-h-9">
-                    <img
-                      src={panel.imageUrl || ''}
+                  <div className="relative aspect-square w-full overflow-hidden rounded-lg bg-gray-100">
+                    {panel.imageUrl ? (
+                      <Image
+                        src={panel.imageUrl}
                       alt={panel.description}
+                        width={512}
+                        height={512}
                       className="object-cover w-full h-full"
                     />
+                    ) : (
+                      <div className="flex items-center justify-center w-full h-full text-gray-400">
+                        <span>Generating image...</span>
+                      </div>
+                    )}
                   </div>
                   <div className="p-4">
                     <p className="text-sm text-gray-600">{panel.description}</p>
